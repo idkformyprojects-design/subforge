@@ -1,0 +1,8 @@
+<resources>
+    <!-- Built-in Android theme: no extra libraries needed. -->
+    <style name="Theme.SubForge" parent="android:Theme.Material.Light.DarkActionBar">
+        <item name="android:colorPrimary">@color/primary</item>
+        <item name="android:colorPrimaryDark">@color/primary_dark</item>
+        <item name="android:colorAccent">@color/primary</item>
+    </style>
+</resources>

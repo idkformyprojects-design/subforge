@@ -1,0 +1,8 @@
+<resources>
+    <!-- Android 10+: follow the phone's light/dark setting. -->
+    <style name="Theme.SubForge" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:colorPrimary">@color/primary</item>
+        <item name="android:colorPrimaryDark">@color/primary_dark</item>
+        <item name="android:colorAccent">@color/primary</item>
+    </style>
+</resources>
