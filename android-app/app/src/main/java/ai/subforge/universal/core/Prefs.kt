@@ -15,12 +15,31 @@ class Prefs(context: Context) {
         get() = (sp.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL).ifBlank { DEFAULT_MODEL }
         set(v) { sp.edit().putString("model", v.trim()).apply() }
 
+    /** Models to use when the main one is busy, comma separated, best first. */
+    var backupModels: String
+        get() = sp.getString("backup_models", DEFAULT_BACKUPS) ?: DEFAULT_BACKUPS
+        set(v) { sp.edit().putString("backup_models", v.trim()).apply() }
+
+    fun backupList(): List<String> =
+        backupModels.split(',', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() && it != model }.distinct()
+
+    /** Second listen by the best model to correct mistakes. About twice the requests. */
+    var doubleCheck: Boolean
+        get() = sp.getBoolean("double_check", false)
+        set(v) { sp.edit().putBoolean("double_check", v).apply() }
+
+    var askedBattery: Boolean
+        get() = sp.getBoolean("asked_battery", false)
+        set(v) { sp.edit().putBoolean("asked_battery", v).apply() }
+
     var languageIndex: Int
         get() = sp.getInt("lang_idx", 1)
         set(v) { sp.edit().putInt("lang_idx", v).apply() }
 
     companion object {
-        const val DEFAULT_MODEL = "gemini-2.5-flash"
+        /** "-latest" names always point to Google's current model, so they do not get retired. */
+        const val DEFAULT_MODEL = "gemini-flash-latest"
+        const val DEFAULT_BACKUPS = "gemini-flash-latest, gemini-flash-lite-latest"
     }
 }
 

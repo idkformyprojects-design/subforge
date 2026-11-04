@@ -2,8 +2,26 @@ package ai.subforge.universal.core
 
 import java.util.Locale
 
-/** One subtitle line. Times are in seconds from the start of the video. */
-data class Cue(var start: Double, var end: Double, var text: String)
+/**
+ * One subtitle line. Times are in seconds from the start of the video.
+ * [part] = which 5-minute part (or translation batch) it came from.
+ * [mark] = MARK_NONE, MARK_BACKUP (made by a backup model) or MARK_FIXED (corrected by the best model).
+ * [edited] = the user changed it by hand, so background re-checks must not overwrite it.
+ */
+data class Cue(
+    var start: Double,
+    var end: Double,
+    var text: String,
+    var part: Int = -1,
+    var mark: Int = MARK_NONE,
+    var edited: Boolean = false,
+) {
+    companion object {
+        const val MARK_NONE = 0
+        const val MARK_BACKUP = 1
+        const val MARK_FIXED = 2
+    }
+}
 
 /** Read and write SubRip (.srt) subtitle files. */
 object Srt {

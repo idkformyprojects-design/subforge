@@ -52,20 +52,20 @@ jobs:
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Rename APK
-        run: mv app/build/outputs/apk/release/*.apk app/build/outputs/apk/release/SubForge-v1.1.0-arm64.apk
+        run: mv app/build/outputs/apk/release/*.apk app/build/outputs/apk/release/SubForge-v1.2.0-arm64.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: SubForge-APK
-          path: android-app/app/build/outputs/apk/release/SubForge-v1.1.0-arm64.apk
+          path: android-app/app/build/outputs/apk/release/SubForge-v1.2.0-arm64.apk
 
       - name: Publish APK as a GitHub Release (easy phone download)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="build-${{ github.run_number }}"
-          gh release create "$TAG" app/build/outputs/apk/release/SubForge-v1.1.0-arm64.apk \
+          gh release create "$TAG" app/build/outputs/apk/release/SubForge-v1.2.0-arm64.apk \
             --repo "${{ github.repository }}" \
-            --title "SubForge v1.1.0 (build ${{ github.run_number }})" \
+            --title "SubForge v1.2.0 (build ${{ github.run_number }})" \
             --notes "Install on Android: open this APK on your phone and allow installing from this source." \
             --target "${{ github.sha }}" --latest

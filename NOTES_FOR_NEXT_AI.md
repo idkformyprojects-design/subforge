@@ -2,11 +2,15 @@
 
 Read this before changing anything.
 
-## State (v1.1.0)
+## State (v1.2.0)
 - The app was rewritten with plain Android Views + FFmpegKit only. All Kotlin compiles against the
   real android-34 API and the real FFmpegKit classes (extracted from the earlier APK). SRT logic is unit-tested.
   All FFmpeg commands were tested on a sample video with desktop FFmpeg, including Bengali/Arabic burn-in.
-- NOT yet verified: a full Gradle build of this version, and running it on a phone with a live Gemini key.
+- v1.1.0 was installed and run on the owner's phone: picking video, audio extraction and Gemini calls work.
+- v1.2.0 adds the background service, backup models, automatic re-check and double-check.
+  The job logic is tested with logic-tests/ (10 scenarios against a fake Gemini server). Run it after every change.
+- Signing: the owner's release key is NOT in the repo. Until the 4 GitHub secrets are added, CI APKs are
+  debug-signed and must be re-signed with the owner's key before they install over the current app.
 
 ## Why the old version was thrown away
 - The old manifest launched `.MainActivity`, but the class lived in `.ui` and was missing from the APK,
@@ -22,6 +26,5 @@ Read this before changing anything.
 5. Never commit keystores or passwords (see `.gitignore`).
 
 ## Next features, in order
-1. Foreground service so long jobs survive leaving the app.
-2. Burned-in subtitle OCR: crop the bottom strip at ~2 fps with FFmpeg, send strips to Gemini vision.
-3. Video preview with subtitles in the editor.
+1. Burned-in subtitle OCR: crop the bottom strip at ~2 fps with FFmpeg, send strips to Gemini vision.
+2. Video preview with subtitles in the editor.

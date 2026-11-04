@@ -3,20 +3,25 @@ package ai.subforge.universal
 import ai.subforge.universal.core.Gemini
 import ai.subforge.universal.core.Languages
 import ai.subforge.universal.core.Media
-import ai.subforge.universal.core.Pipeline
 import ai.subforge.universal.core.Prefs
 import ai.subforge.universal.core.Project
+import ai.subforge.universal.core.ProjectStore
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.InputType
 import android.view.View
-import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -36,12 +41,13 @@ class MainActivity : Activity() {
     private lateinit var langSpinner: Spinner
     private lateinit var startBtn: Button
     private lateinit var cancelBtn: Button
+    private lateinit var continueBtn: Button
     private lateinit var openLastBtn: Button
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
 
     private var videoUri: Uri? = null
-    private var pipeline: Pipeline? = null
+    private val onChange = Runnable { refresh() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,7 +64,39 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        openLastBtn.visibility = if (Project.exists(this)) View.VISIBLE else View.GONE
+        ProjectStore.addListener(onChange)
+        refresh()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        ProjectStore.removeListener(onChange)
+    }
+
+    /** Shows the live state of the background job. */
+    private fun refresh() {
+        val running = ProjectStore.running
+        val p = if (Project.exists(this)) ProjectStore.get(this) else null
+        startBtn.isEnabled = !running
+        cancelBtn.visibility = if (running) View.VISIBLE else View.GONE
+        progress.visibility = if (running) View.VISIBLE else View.GONE
+        if (running) {
+            val f = ProjectStore.fraction
+            progress.isIndeterminate = f < 0
+            if (f >= 0) progress.progress = (f * 1000).toInt()
+            status.text = ProjectStore.statusText + "\n\nYou can lock the phone or use other apps. You'll get a notification when it's done."
+        } else if (p != null && p.message.isNotBlank()) {
+            status.text = p.message
+        }
+        openLastBtn.visibility = if (p != null && p.cues.isNotEmpty()) View.VISIBLE else View.GONE
+        val canContinue = !running && p != null &&
+            (p.state == Project.STATE_STOPPED || p.state == Project.STATE_PARTIAL ||
+                p.state == Project.STATE_WORKING || p.state == Project.STATE_IMPROVING)
+        continueBtn.visibility = if (canContinue) View.VISIBLE else View.GONE
+        if (p != null) {
+            continueBtn.text = if (p.todoCount() > 0) "Continue unfinished job (${p.videoName})"
+            else "Re-check with the best model (${p.videoName})"
+        }
     }
 
     private fun buildUi() {
@@ -91,6 +129,13 @@ class MainActivity : Activity() {
         }
         col.addView(langSpinner)
 
+        col.addView(CheckBox(this).apply {
+            text = "Double-check every part with the best model (most accurate, uses about twice as many requests)"
+            isChecked = prefs.doubleCheck
+            setPadding(0, dp(12), 0, 0)
+            setOnCheckedChangeListener { _, on -> prefs.doubleCheck = on }
+        })
+
         startBtn = button("Start") { start() }
         col.addView(space(16))
         col.addView(startBtn)
@@ -102,19 +147,21 @@ class MainActivity : Activity() {
         col.addView(progress)
         status = TextView(this).apply { setPadding(0, dp(8), 0, dp(8)) }
         col.addView(status)
-        cancelBtn = button("Cancel") { pipeline?.cancel(); status.text = "Cancelling…" }.apply { visibility = View.GONE }
+        cancelBtn = button("Cancel") { JobService.cancel(this); status.text = "Cancelling…" }.apply { visibility = View.GONE }
         col.addView(cancelBtn)
+        continueBtn = button("Continue") { resumeJob() }.apply { visibility = View.GONE }
+        col.addView(continueBtn)
 
         col.addView(space(24))
-        openLastBtn = button("Open last subtitles") { openEditor() }
+        openLastBtn = button("Open subtitles") { openEditor() }
         col.addView(openLastBtn)
-        col.addView(button("Settings (Gemini API key)") { showSettings() })
+        col.addView(button("Settings (Gemini API key, models)") { showSettings() })
 
         col.addView(TextView(this).apply {
             setPadding(0, dp(20), 0, 0)
             textSize = 13f
             text = "Your video stays on your phone. Only the sound (about 1 MB per 5 minutes) is sent to Google Gemini, " +
-                "using your own free API key. Keep this screen open while it works; a 2-hour movie takes roughly 5–15 minutes."
+                "using your own free API key. Work continues in the background; a 2-hour movie takes roughly 5–20 minutes."
         })
 
         setContentView(ScrollView(this).apply { addView(col) })
@@ -138,10 +185,10 @@ class MainActivity : Activity() {
         if (requestCode != REQ_PICK || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         try {
-            // Keep access after restarts, so the editor can still export this video later.
+            // Keep access after restarts, so the background job and the editor can still read this video.
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         } catch (e: SecurityException) {
-            // some file pickers do not offer it; access still works for this session
+            // some file pickers do not offer it; access still works while the app is running
         }
         videoUri = uri
         videoLabel.text = Media.displayName(this, uri)
@@ -154,49 +201,55 @@ class MainActivity : Activity() {
             showSettings()
             return
         }
-        val langIdx = langSpinner.selectedItemPosition
-        prefs.languageIndex = langIdx
-        val lang = Languages.get(langIdx)
-        val fromSpeech = modeGroup.checkedRadioButtonId == MODE_SPEECH
-        val name = Media.displayName(this, uri)
-
-        setBusy(true)
-        val p = Pipeline(applicationContext, Gemini(prefs.apiKey, prefs.model)) { msg, f ->
-            runOnUiThread {
-                status.text = msg
-                progress.progress = (f.coerceIn(0.0, 1.0) * 1000).toInt()
-            }
-        }
-        pipeline = p
-        thread(name = "subforge-job") {
-            try {
-                val cues = if (fromSpeech) p.fromSpeech(uri, lang) else p.fromSubtitleTrack(uri, lang)
-                if (cues.isEmpty()) throw IllegalStateException("No speech was found in this video.")
-                Project(uri, name, langIdx, cues.toMutableList()).save(applicationContext)
-                runOnUiThread {
-                    setBusy(false)
-                    status.text = "Done: ${cues.size} subtitle lines."
-                    openEditor()
-                }
-            } catch (e: InterruptedException) {
-                runOnUiThread { setBusy(false); status.text = "Cancelled." }
-            } catch (e: Exception) {
-                val msg = if (e.message == "Cancelled") "Cancelled." else "Problem: ${e.message ?: e.toString()}"
-                runOnUiThread { setBusy(false); status.text = msg }
-            }
+        val p = if (Project.exists(this)) ProjectStore.get(this) else null
+        if (p != null && p.cues.isNotEmpty() && p.state != Project.STATE_DONE) {
+            AlertDialog.Builder(this)
+                .setMessage("Starting a new video replaces the unfinished subtitles for \"${p.videoName}\". Continue?")
+                .setPositiveButton("Start new") { _, _ -> startNow(uri) }
+                .setNegativeButton("Keep", null)
+                .show()
+        } else {
+            startNow(uri)
         }
     }
 
-    private fun setBusy(busy: Boolean) {
-        startBtn.isEnabled = !busy
-        cancelBtn.visibility = if (busy) View.VISIBLE else View.GONE
-        progress.visibility = if (busy) View.VISIBLE else View.GONE
-        if (busy) {
-            progress.progress = 0
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            pipeline = null
+    private fun startNow(uri: Uri) {
+        askPermissionsOnce()
+        val langIdx = langSpinner.selectedItemPosition
+        prefs.languageIndex = langIdx
+        val fromSpeech = modeGroup.checkedRadioButtonId == MODE_SPEECH
+        ProjectStore.status("Starting…", -1.0)
+        JobService.start(this, uri, Media.displayName(this, uri), langIdx, fromSpeech)
+        startBtn.isEnabled = false // the service takes over a moment later and updates the screen
+        status.text = "Starting…"
+    }
+
+    private fun resumeJob() {
+        if (prefs.apiKey.isBlank()) return showSettings()
+        askPermissionsOnce()
+        ProjectStore.status("Continuing…", -1.0)
+        JobService.resume(this)
+        continueBtn.visibility = View.GONE
+        status.text = "Continuing…"
+    }
+
+    /** Notifications (Android 13+) and "run in background without limits" so long jobs are not stopped. */
+    private fun askPermissionsOnce() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFY)
+        }
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!prefs.askedBattery && !pm.isIgnoringBatteryOptimizations(packageName)) {
+            prefs.askedBattery = true
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                )
+            } catch (e: Exception) {
+                // some phones do not have this screen
+            }
         }
     }
 
@@ -209,7 +262,8 @@ class MainActivity : Activity() {
         val pad = dp(20)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, dp(8), pad, 0) }
         box.addView(TextView(this).apply {
-            text = "Get a free key at aistudio.google.com/apikey (sign in with Google → Create API key), then paste it here."
+            text = "Get a free key at aistudio.google.com/apikey (sign in with Google → Create API key), then paste it here. " +
+                "One key works for every model."
         })
         val keyField = EditText(this).apply {
             hint = "Gemini API key"
@@ -218,26 +272,38 @@ class MainActivity : Activity() {
             isSingleLine = true
         }
         box.addView(keyField)
-        box.addView(TextView(this).apply { text = "Model"; setPadding(0, dp(12), 0, 0) })
+        box.addView(TextView(this).apply { text = "Best model (used first)"; setPadding(0, dp(12), 0, 0) })
         val modelField = EditText(this).apply { setText(prefs.model); isSingleLine = true }
         box.addView(modelField)
+        box.addView(TextView(this).apply { text = "Backup models when it is busy (comma separated)"; setPadding(0, dp(12), 0, 0) })
+        val backupField = EditText(this).apply { setText(prefs.backupModels); isSingleLine = true }
+        box.addView(backupField)
+        box.addView(button("Reset models to default") {
+            modelField.setText(Prefs.DEFAULT_MODEL)
+            backupField.setText(Prefs.DEFAULT_BACKUPS)
+        })
+
+        fun save() {
+            prefs.apiKey = keyField.text.toString()
+            prefs.model = modelField.text.toString()
+            prefs.backupModels = backupField.text.toString()
+        }
 
         AlertDialog.Builder(this)
             .setTitle("Settings")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ ->
-                prefs.apiKey = keyField.text.toString()
-                prefs.model = modelField.text.toString()
-                toast("Saved")
-            }
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Save") { _, _ -> save(); toast("Saved") }
             .setNeutralButton("Save & test") { _, _ ->
-                prefs.apiKey = keyField.text.toString()
-                prefs.model = modelField.text.toString()
-                status.text = "Testing your key…"
-                val g = Gemini(prefs.apiKey, prefs.model)
+                save()
+                status.text = "Testing your key with ${prefs.model}…"
+                val g = Gemini(prefs.apiKey)
+                val model = prefs.model
                 thread {
-                    val err = g.test()
-                    runOnUiThread { status.text = if (err == null) "Key works ✓" else "Key test failed: $err" }
+                    val err = g.test(model)
+                    runOnUiThread {
+                        status.text = if (err == null) "Key works with $model ✓"
+                        else "Test failed: $err\n(If it says busy, the key is fine; Google is just overloaded right now.)"
+                    }
                 }
             }
             .setNegativeButton("Close", null)
@@ -269,6 +335,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_PICK = 10
+        private const val REQ_NOTIFY = 11
         private const val MODE_SPEECH = 101
         private const val MODE_TRACK = 102
     }

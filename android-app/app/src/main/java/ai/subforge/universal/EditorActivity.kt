@@ -3,10 +3,12 @@ package ai.subforge.universal
 import ai.subforge.universal.core.Cue
 import ai.subforge.universal.core.Media
 import ai.subforge.universal.core.Project
+import ai.subforge.universal.core.ProjectStore
 import ai.subforge.universal.core.Srt
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
@@ -26,21 +28,24 @@ import kotlin.concurrent.thread
 
 class EditorActivity : Activity() {
 
-    private lateinit var project: Project
     private lateinit var adapter: CueAdapter
     private lateinit var info: TextView
+    private lateinit var recheckBtn: Button
+    private var rows: List<Cue> = emptyList()
     private var pendingExport: Media.Export? = null
     private var exporting = false
+    private val onChange = Runnable { refresh() }
+
+    private fun project(): Project? = ProjectStore.get(this)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val p = Project.load(this)
+        val p = project()
         if (p == null) {
             Toast.makeText(this, "Could not open the subtitles", Toast.LENGTH_LONG).show()
             finish()
             return
         }
-        project = p
         title = p.videoName.ifBlank { "Subtitles" }
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -53,34 +58,59 @@ class EditorActivity : Activity() {
         bar.addView(barButton("Shift time") { shiftAll() })
         root.addView(bar)
 
-        info = TextView(this).apply { setPadding(dp(12), dp(6), dp(12), dp(6)); textSize = 13f }
+        info = TextView(this).apply { setPadding(dp(12), dp(6), dp(12), dp(2)); textSize = 13f }
         root.addView(info)
+        recheckBtn = Button(this).apply {
+            isAllCaps = false
+            text = "Re-check now with the best model"
+            visibility = View.GONE
+            setOnClickListener { JobService.resume(this@EditorActivity); visibility = View.GONE }
+        }
+        root.addView(recheckBtn)
 
         adapter = CueAdapter()
         val list = ListView(this).apply {
             adapter = this@EditorActivity.adapter
-            setOnItemClickListener { _, _, pos, _ -> editCue(pos) }
+            setOnItemClickListener { _, _, pos, _ -> rows.getOrNull(pos)?.let { editCue(it) } }
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         root.addView(list)
         setContentView(root)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ProjectStore.addListener(onChange)
         refresh()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        ProjectStore.removeListener(onChange)
     }
 
     private fun refresh() {
+        val p = project() ?: return
+        rows = synchronized(ProjectStore) { p.cues.toList() }
         adapter.notifyDataSetChanged()
-        info.text = "${project.cues.size} lines · ${project.language.name} · tap a line to edit it"
-    }
 
-    private fun persist() {
-        project.save(this)
-        refresh()
+        val backup = rows.count { it.mark == Cue.MARK_BACKUP }
+        val fixed = rows.count { it.mark == Cue.MARK_FIXED }
+        val sb = StringBuilder("${rows.size} lines · ${p.language.name} · tap a line to edit it")
+        if (fixed > 0) sb.append("\n✓ $fixed line(s) corrected by the best model")
+        if (backup > 0) sb.append("\n⚠ $backup line(s) made by a backup model")
+        if (ProjectStore.running) sb.append("\n⟳ ").append(ProjectStore.statusText)
+        else if (p.message.isNotBlank() && p.state != Project.STATE_DONE) sb.append("\n").append(p.message)
+        info.text = sb.toString()
+
+        val canRecheck = !ProjectStore.running &&
+            (p.state == Project.STATE_PARTIAL || p.state == Project.STATE_STOPPED || p.backupCount() > 0)
+        recheckBtn.visibility = if (canRecheck) View.VISIBLE else View.GONE
     }
 
     // ---------------------------------------------------------------- editing
 
-    private fun editCue(pos: Int) {
-        val c = project.cues[pos]
+    private fun editCue(c: Cue) {
         val pad = dp(20)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, dp(8), pad, 0) }
         val startF = timeField(c.start)
@@ -95,7 +125,7 @@ class EditorActivity : Activity() {
         box.addView(label("Text")); box.addView(textF)
 
         AlertDialog.Builder(this)
-            .setTitle("Line ${pos + 1}")
+            .setTitle("Edit line")
             .setView(box)
             .setPositiveButton("Save") { _, _ ->
                 val s = Srt.parseTime(startF.text.toString())
@@ -104,20 +134,38 @@ class EditorActivity : Activity() {
                     toast("Times must look like 00:01:02,500 and end after start")
                     return@setPositiveButton
                 }
-                c.start = s; c.end = e; c.text = textF.text.toString().trim()
-                project.cues.sortBy { it.start }
-                persist()
+                ProjectStore.edit(this) { p ->
+                    c.start = s; c.end = e; c.text = textF.text.toString().trim()
+                    c.edited = true
+                    p.cues.sortBy { it.start }
+                }
             }
-            .setNeutralButton("Delete") { _, _ -> project.cues.removeAt(pos); persist() }
+            .setNeutralButton("Delete") { _, _ ->
+                ProjectStore.edit(this) { p ->
+                    // keep a hidden marker so the background check knows this part was edited by hand
+                    markPartEdited(p, c)
+                    p.cues.remove(c)
+                }
+            }
             .setNegativeButton("Add line after") { _, _ ->
-                val nextStart = project.cues.getOrNull(pos + 1)?.start ?: (c.end + 3.0)
-                val s = c.end + 0.1
-                val e = if (nextStart - 0.1 > s + 0.5) nextStart - 0.1 else s + 2.0
-                project.cues.add(pos + 1, Cue(s, e, "…"))
-                persist()
-                editCue(pos + 1)
+                var added: Cue? = null
+                ProjectStore.edit(this) { p ->
+                    val idx = p.cues.indexOf(c)
+                    val nextStart = p.cues.getOrNull(idx + 1)?.start ?: (c.end + 3.0)
+                    val s = c.end + 0.1
+                    val e = if (nextStart - 0.1 > s + 0.5) nextStart - 0.1 else s + 2.0
+                    val n = Cue(s, e, "…", c.part, Cue.MARK_NONE, true)
+                    p.cues.add(if (idx >= 0) idx + 1 else p.cues.size, n)
+                    added = n
+                }
+                added?.let { editCue(it) }
             }
             .show()
+    }
+
+    /** After deleting a line, another line of the same part is flagged so re-checks leave the part alone. */
+    private fun markPartEdited(p: Project, removed: Cue) {
+        p.cues.firstOrNull { it !== removed && it.part == removed.part }?.edited = true
     }
 
     /** Moves every line earlier or later, for when all subtitles are out of sync by the same amount. */
@@ -129,7 +177,10 @@ class EditorActivity : Activity() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), 0)
-            addView(TextView(this@EditorActivity).apply { text = "Seconds to move all lines (minus = earlier):" })
+            addView(TextView(this@EditorActivity).apply {
+                text = "Seconds to move all lines (minus = earlier):" +
+                    if (ProjectStore.running) "\n\nNote: this stops the background re-check from changing these lines." else ""
+            })
             addView(f)
         }
         AlertDialog.Builder(this)
@@ -137,11 +188,13 @@ class EditorActivity : Activity() {
             .setView(box)
             .setPositiveButton("Shift") { _, _ ->
                 val d = f.text.toString().toDoubleOrNull() ?: return@setPositiveButton
-                for (c in project.cues) {
-                    c.start = (c.start + d).coerceAtLeast(0.0)
-                    c.end = (c.end + d).coerceAtLeast(c.start + 0.3)
+                ProjectStore.edit(this) { p ->
+                    for (c in p.cues) {
+                        c.start = (c.start + d).coerceAtLeast(0.0)
+                        c.end = (c.end + d).coerceAtLeast(c.start + 0.3)
+                        c.edited = true
+                    }
                 }
-                persist()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -149,13 +202,14 @@ class EditorActivity : Activity() {
 
     // ---------------------------------------------------------------- saving and exporting
 
-    private fun baseName(): String = project.videoName.substringBeforeLast('.').ifBlank { "subtitles" }
+    private fun baseName(): String = (project()?.videoName ?: "").substringBeforeLast('.').ifBlank { "subtitles" }
 
     private fun saveSrt() {
+        val lang = project()?.language?.iso639_2 ?: "und"
         val i = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/x-subrip"
-            putExtra(Intent.EXTRA_TITLE, "${baseName()}.${project.language.iso639_2}.srt")
+            putExtra(Intent.EXTRA_TITLE, "${baseName()}.$lang.srt")
         }
         startActivityForResult(i, REQ_SRT)
     }
@@ -163,8 +217,9 @@ class EditorActivity : Activity() {
     private fun chooseExport() {
         if (exporting) return toast("An export is already running")
         val kinds = Media.Export.values()
+        val note = if (ProjectStore.running) "\n(The background re-check is still running; export now or wait for the notification.)" else ""
         AlertDialog.Builder(this)
-            .setTitle("Export video")
+            .setTitle("Export video$note")
             .setItems(kinds.map { it.label }.toTypedArray()) { _, which ->
                 val k = kinds[which]
                 pendingExport = k
@@ -191,7 +246,8 @@ class EditorActivity : Activity() {
 
     private fun writeSrt(uri: Uri) {
         try {
-            contentResolver.openOutputStream(uri, "w")!!.use { it.write(Srt.format(project.cues).toByteArray(Charsets.UTF_8)) }
+            val text = synchronized(ProjectStore) { Srt.format(project()?.cues ?: emptyList()) }
+            contentResolver.openOutputStream(uri, "w")!!.use { it.write(text.toByteArray(Charsets.UTF_8)) }
             toast("Subtitle file saved")
         } catch (e: Exception) {
             toast("Could not save: ${e.message}")
@@ -199,9 +255,10 @@ class EditorActivity : Activity() {
     }
 
     private fun exportVideo(out: Uri, kind: Media.Export) {
+        val p = project() ?: return
         exporting = true
-        val srt = project.srtFile(this)
-        val duration = Media.durationSec(this, project.videoUri)
+        val srt = synchronized(ProjectStore) { p.srtFile(this) }
+        val duration = Media.durationSec(this, p.videoUri)
 
         val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
@@ -221,9 +278,10 @@ class EditorActivity : Activity() {
             .show()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val lang = project.language.iso639_2
+        val lang = p.language.iso639_2
+        val video = p.videoUri
         thread(name = "subforge-export") {
-            val res = Media.export(applicationContext, project.videoUri, srt, out, kind, lang) { t ->
+            val res = Media.export(applicationContext, video, srt, out, kind, lang) { t ->
                 if (duration > 0) runOnUiThread {
                     val f = (t / duration).coerceIn(0.0, 1.0)
                     bar.progress = (f * 1000).toInt()
@@ -253,8 +311,8 @@ class EditorActivity : Activity() {
     // ---------------------------------------------------------------- list rows
 
     private inner class CueAdapter : BaseAdapter() {
-        override fun getCount() = project.cues.size
-        override fun getItem(position: Int): Any = project.cues[position]
+        override fun getCount() = rows.size
+        override fun getItem(position: Int): Any = rows[position]
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
@@ -263,10 +321,19 @@ class EditorActivity : Activity() {
                 setPadding(dp(12), dp(8), dp(12), dp(8))
                 addView(TextView(this@EditorActivity).apply { textSize = 12f; setTypeface(Typeface.MONOSPACE) })
                 addView(TextView(this@EditorActivity).apply { textSize = 16f })
+                addView(TextView(this@EditorActivity).apply { textSize = 12f })
             }
-            val c = project.cues[position]
+            val c = rows[position]
             (row.getChildAt(0) as TextView).text = "${position + 1}   ${Srt.ts(c.start)} → ${Srt.ts(c.end)}"
             (row.getChildAt(1) as TextView).text = c.text
+            val tag = row.getChildAt(2) as TextView
+            when {
+                c.edited -> { tag.text = "✎ edited by you"; tag.setTextColor(Color.rgb(99, 102, 241)) }
+                c.mark == Cue.MARK_FIXED -> { tag.text = "✓ corrected by the best model"; tag.setTextColor(Color.rgb(22, 163, 74)) }
+                c.mark == Cue.MARK_BACKUP -> { tag.text = "⚠ made by a backup model"; tag.setTextColor(Color.rgb(217, 119, 6)) }
+                else -> tag.text = ""
+            }
+            tag.visibility = if (tag.text.isEmpty()) View.GONE else View.VISIBLE
             return row
         }
     }

@@ -1,4 +1,4 @@
-# SubForge (v1.1.0)
+# SubForge (v1.2.0)
 
 Android app that makes subtitles for any video, in any language, using your own **free** Google Gemini key.
 
@@ -16,17 +16,31 @@ Android app that makes subtitles for any video, in any language, using your own 
 
 The video never leaves the phone. Only the sound goes to Gemini.
 
+### New in v1.2.0
+- **Runs in the background** with a progress notification and a Cancel button. Lock the phone or use other apps.
+- **Never gives up because Google is busy.** The best model is tried first; if it stays busy, a backup model
+  (Settings → backup models) makes that part so the job keeps going.
+- **Automatic re-check.** Parts made by a backup model are redone by the best model as soon as it is free
+  (it keeps trying for up to 45 minutes; "Re-check now" in the editor tries again later).
+- **Double-check (optional switch).** The best model listens to every part again next to the finished subtitles
+  and fixes misheard words, names, missing lines, timing and translation. Uses about twice the requests.
+- **Notifications:** "Subtitles ready" when you can start editing, and "All done ✓" when re-checks finish.
+- **Continue after interruptions.** Every finished part is saved; "Continue" picks up where it stopped.
+- **Your edits are safe.** Background re-checks never overwrite a part you edited by hand.
+- Editor marks: ✓ corrected by the best model · ⚠ made by a backup model · ✎ edited by you.
+
 ## Not in this version (yet)
 
 - Reading subtitles that are burned into the picture (OCR)
 - Picture-based DVD/Blu-ray subtitle tracks
-- Background processing: keep the app open while it works (the screen stays on by itself)
 
 ## Setup on the phone
 
 1. Get a free key: <https://aistudio.google.com/apikey> → **Create API key**.
 2. Open SubForge → **Settings** → paste the key → **Save & test**.
-3. If Google retires the model name, type a newer one in Settings (default `gemini-2.5-flash`).
+3. Default models: best `gemini-flash-latest`, backups `gemini-flash-latest, gemini-flash-lite-latest`.
+   "-latest" names follow Google's newest model, so they do not get retired. One key works for all models.
+4. When asked, allow notifications and "run in background without restrictions" so long jobs are not stopped.
 
 ## Build the APK
 
@@ -53,9 +67,12 @@ android-app/app/src/main/java/ai/subforge/universal/
   EditorActivity.kt    edit lines, save .srt, export video
   core/Media.kt        all FFmpeg work (audio clips, subtitle track, mux, burn-in)
   core/Gemini.kt       Gemini calls (transcribe audio clip, translate lines), retries + free-tier pacing
-  core/Project.kt      saves the current subtitles; Pipeline = the full job
+  JobService.kt        background service: notifications, cancel, wake lock
+  core/Worker.kt       the job: parts, best/backup models, re-check, double-check, continue
+  core/Project.kt      the saved project (parts + lines) and the shared ProjectStore
   core/Cue.kt          subtitle line + SRT read/write
   core/Prefs.kt        settings + language list
+logic-tests/           runs the job logic against a fake Gemini server (bash logic-tests/run.sh)
 backend/               optional Python server from the first plan; the app does NOT need it
 ```
 
